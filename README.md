@@ -56,9 +56,9 @@ This toolkit has already saved its owners thousands:
 
 ## Get It Now
 
-→ **[Buy on Gumroad](https://gumroad.com/)** *(link coming soon)*
+→ **[Buy Now — $39 Lifetime](https://casstielunitec-boop.github.io/crypto-intelligence-toolkit/)**
 
-Or DM to pay directly via USDT/ETH.
+Pay with crypto (USDT/ETH/BTC) or card via Gumroad. Instant download after payment.
 
 ## Who Built This
 

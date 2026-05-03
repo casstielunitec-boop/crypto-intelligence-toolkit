@@ -30,6 +30,15 @@ Step-by-step from zero to alerts flowing. English + Chinese.
 
 ### Price: $39 one-time. Lifetime access.
 
+### How to Pay
+
+**USDT (BASE network):**
+```
+0x55048FA1c45E7E45ae6c6f8e02Cb2565F6C04d14
+```
+Send $39 USDT on BASE network (BSC-compatible, near-zero fees).
+Once payment is confirmed, I'll send you the download link within 24 hours.
+
 ### Why This Price?
 
 A single whale alert can save you $500 in a dump.
@@ -43,4 +52,4 @@ I'll refund you. No questions.
 
 ---
 
-Questions? DM me on the platform or find me in crypto Discord servers.
+Questions? DM me or open an issue on GitHub.

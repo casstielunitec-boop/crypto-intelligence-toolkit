@@ -56,9 +56,15 @@ This toolkit has already saved its owners thousands:
 
 ## Get It Now
 
-→ **[Buy Now — $39 Lifetime](https://casstielunitec-boop.github.io/crypto-intelligence-toolkit/)**
+**$39 — one time payment. Pay with crypto:**
 
-Pay with crypto (USDT/ETH/BTC) or card via Gumroad. Instant download after payment.
+```
+USDT (BASE network): 0x55048FA1c45E7E45ae6c6f8e02Cb2565F6C04d14
+```
+
+Send $39 USDT on BASE network. I'll email you the download link within 24 hours.
+
+Credit card payments coming soon via Gumroad.
 
 ## Who Built This
 

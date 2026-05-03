@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 """
-Binance Spot Auto-Trading Bot (Minimal Self-Contained)
-=======================================================
-This is your trading engine in ~200 lines.
-
-Features:
-  - BUY/SELL with stop-loss and take-profit
-  - Configurable position size and signal thresholds
-  - Runs on BTCUSDT, ETHUSDT, or any spot pair
-  - Dry-run mode for testing without real money
+Binance Spot Trading Bot
+========================
+Simple momentum-based strategy with dry-run mode.
+~250 lines, zero bloat.
 
 Setup:
   1. pip install requests python-dotenv
-  2. Create .env with BINANCE_API_KEY and BINANCE_SECRET_KEY
-  3. Set DRY_RUN=false when you're ready for real trades
+  2. Copy .env.example to .env, fill in your keys
+  3. Run: python trading_bot.py BTCUSDT 0.001
 
-Usage:
-  python trading_bot.py BTCUSDT 0.001
+The bot starts in DRY-RUN mode by default (no real orders).
+Set DRY_RUN=false in .env to trade live.
 """
 from __future__ import annotations
 
@@ -25,177 +20,261 @@ import hmac
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from current dir or parent
+env_path = Path(__file__).resolve().parent.parent / ".env"
+if env_path.exists():
+    load_dotenv(env_path)
+else:
+    load_dotenv()
 
+# ── Logging ──────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("trading_bot")
 
-# ── Config ──────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────
 API_KEY = os.getenv("BINANCE_API_KEY", "")
-API_SECRET = os.getenv("BINANCE_SECRET_KEY", "")
+API_SECRET = os.getenv("BINANCE_SECRET_KEY", os.getenv("BINANCE_API_SECRET", ""))
 BASE_URL = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
-# ── Strategy Params ─────────────────────────────────────
-ENTRY_MOMENTUM_BPS = 6       # Enter when short-term momentum > this
-MIN_PROFIT_BPS = 15          # Fee gate: signal must exceed fees + buffer
-STOP_LOSS_BPS = -30          # Exit if PnL drops below this
-TAKE_PROFIT_BPS = 50         # Exit if PnL exceeds this
-FAST_WINDOW = 8              # Periods for fast MA
-SLOW_WINDOW = 34             # Periods for slow MA
-INTERVAL_SEC = 180           # Seconds between ticks
+if not API_KEY or not API_SECRET:
+    log.error("❌ BINANCE_API_KEY and BINANCE_SECRET_KEY must be set in .env")
+    sys.exit(1)
 
+# ── Strategy Parameters ──────────────────────────────────
+FAST_WINDOW = 8       # Fast SMA periods
+SLOW_WINDOW = 34      # Slow SMA periods
+STOP_LOSS_BPS = -30   # -0.3% stop-loss
+TAKE_PROFIT_BPS = 50  # +0.5% take-profit
+MIN_PROFIT_BPS = 15   # Fee gate: skip trades below this edge
+INTERVAL_SEC = 180    # Seconds between cycles
 
-# ── Binance API ─────────────────────────────────────────
+# ── Binance API Helpers ──────────────────────────────────
 def _sign(params: dict) -> str:
     qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
     return hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
 
 
-def _request(method: str, endpoint: str, params: dict | None = None, signed: bool = False) -> dict:
+def _request(method: str, endpoint: str, params: dict | None = None,
+             signed: bool = False) -> dict | list:
     headers = {"X-MBX-APIKEY": API_KEY}
     url = BASE_URL + endpoint
-    if signed and params:
+    if signed:
+        params = params or {}
         params["timestamp"] = int(time.time() * 1000)
         params["signature"] = _sign(params)
-    resp = requests.request(method, url, params=params, headers=headers, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
+    try:
+        resp = requests.request(method, url, params=params, headers=headers, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.HTTPError as e:
+        log.error("API error: %s — %s", e, resp.text[:200])
+        raise
+    except requests.exceptions.Timeout:
+        log.warning("API timeout on %s %s", method, endpoint)
+        raise
 
 
 def get_price(symbol: str) -> Decimal:
     data = _request("GET", "/api/v3/ticker/price", {"symbol": symbol})
-    return Decimal(data["price"])
+    return Decimal(str(data["price"]))
 
 
-def get_account() -> dict:
-    return _request("GET", "/api/v3/account", {}, signed=True)
+def get_klines(symbol: str, limit: int = 50, interval: str = "1m") -> list[dict]:
+    """Fetch recent klines/candlesticks."""
+    data = _request("GET", "/api/v3/klines", {
+        "symbol": symbol, "interval": interval, "limit": limit
+    })
+    result = []
+    for k in data:
+        result.append({
+            "time": k[0],
+            "open": Decimal(str(k[1])),
+            "high": Decimal(str(k[2])),
+            "low": Decimal(str(k[3])),
+            "close": Decimal(str(k[4])),
+            "volume": Decimal(str(k[5])),
+        })
+    return result
 
 
-def place_order(symbol: str, side: str, quantity: Decimal, order_type: str = "MARKET") -> dict:
+def get_account_balance(asset: str = "USDT") -> Decimal:
+    account = _request("GET", "/api/v3/account", {}, signed=True)
+    for bal in account.get("balances", []):
+        if bal["asset"] == asset:
+            return Decimal(str(bal["free"]))
+    return Decimal("0")
+
+
+def get_position_qty(symbol: str) -> Decimal:
+    """Get the free quantity of the base asset (e.g. BTC for BTCUSDT)."""
+    base = symbol.replace("USDT", "")
+    return get_account_balance(base)
+
+
+def place_order(symbol: str, side: str, quantity: Decimal) -> dict:
     params = {
         "symbol": symbol,
         "side": side.upper(),
-        "type": order_type.upper(),
+        "type": "MARKET",
         "quantity": f"{quantity:.6f}",
-        "newClientOrderId": f"toolkit_{int(time.time()*1000)}",
     }
     endpoint = "/api/v3/order/test" if DRY_RUN else "/api/v3/order"
     return _request("POST", endpoint, params, signed=True)
 
 
-# ── Strategy Engine ─────────────────────────────────────
-def avg(values: list[Decimal], window: int) -> Decimal | None:
+# ── Strategy ─────────────────────────────────────────────
+def sma(values: list[Decimal], window: int) -> Decimal | None:
     if len(values) < window:
         return None
-    return sum(values[-window:], Decimal("0")) / Decimal(window)
+    return sum(values[-window:]) / Decimal(window)
 
 
-def momentum_bps(prices: list[Decimal]) -> Decimal | None:
-    fast = avg(prices, FAST_WINDOW)
-    slow = avg(prices, SLOW_WINDOW)
-    if fast is None or slow is None:
+def compute_signal(prices: list[Decimal]) -> dict:
+    """Return dict with 'action' (BUY/SELL/HOLD), 'momentum_bps', details."""
+    fast = sma(prices, FAST_WINDOW)
+    slow = sma(prices, SLOW_WINDOW)
+    if fast is None or slow is None or slow == 0:
+        return {"action": "HOLD", "momentum_bps": 0, "reason": "warming up"}
+
+    mom_bps = int(((fast - slow) / slow) * 10000)
+    current = prices[-1]
+
+    # Determine action
+    if mom_bps > MIN_PROFIT_BPS:
+        return {"action": "BUY", "momentum_bps": mom_bps,
+                "reason": f"fast > slow by {mom_bps} bps"}
+    elif mom_bps < -MIN_PROFIT_BPS:
+        return {"action": "SELL", "momentum_bps": mom_bps,
+                "reason": f"fast < slow by {abs(mom_bps)} bps"}
+    else:
+        return {"action": "HOLD", "momentum_bps": mom_bps,
+                "reason": f"signal {mom_bps} bps inside fee gate"}
+
+
+def should_exit(symbol: str, entry_price: Decimal, current_price: Decimal,
+                position_qty: Decimal) -> str | None:
+    """Return 'STOP_LOSS', 'TAKE_PROFIT', or None."""
+    if position_qty == 0 or entry_price == 0:
         return None
-    return ((fast - slow) / slow) * Decimal("10000")
-
-
-def decide(symbol: str, prices: list[Decimal], position_qty: Decimal, position_entry: Decimal) -> str:
-    """Returns: BUY | SELL | HOLD"""
-    mom = momentum_bps(prices)
-    if mom is None:
-        return "HOLD"
-
-    current = prices[-1] if prices else Decimal("0")
-
-    # Check exit conditions
-    if position_qty > 0 and position_entry > 0:
-        pnl_bps = ((current - position_entry) / position_entry) * Decimal("10000")
-        if pnl_bps <= STOP_LOSS_BPS:
-            log.info("STOP LOSS triggered at %.1f bps", pnl_bps)
-            return "SELL"
-        if pnl_bps >= TAKE_PROFIT_BPS:
-            log.info("TAKE PROFIT at %.1f bps", pnl_bps)
-            return "SELL"
-
-    # Check entry conditions
-    if position_qty == 0 and mom >= ENTRY_MOMENTUM_BPS:
-        signal = abs(mom)
-        if signal >= MIN_PROFIT_BPS:
-            return "BUY"
-
-    return "HOLD"
+    pnl_bps = int(((current_price - entry_price) / entry_price) * 10000)
+    if pnl_bps <= STOP_LOSS_BPS:
+        return "STOP_LOSS"
+    if pnl_bps >= TAKE_PROFIT_BPS:
+        return "TAKE_PROFIT"
+    return None
 
 
 # ── Main Loop ────────────────────────────────────────────
-def run(symbol: str, qty: Decimal):
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: python trading_bot.py <SYMBOL> <QTY>")
+        print("  Example: python trading_bot.py BTCUSDT 0.001")
+        sys.exit(1)
+
+    symbol = sys.argv[1].upper()
+    qty = Decimal(str(sys.argv[2]))
+    mode = "DRY-RUN" if DRY_RUN else "LIVE"
+
+    log.info("=" * 50)
+    log.info("🚀 Crypto Intelligence Trading Bot")
+    log.info("  Symbol:     %s", symbol)
+    log.info("  Quantity:   %s", qty)
+    log.info("  Mode:       %s", mode)
+    log.info("  Strategy:   SMA(%d, %d)", FAST_WINDOW, SLOW_WINDOW)
+    log.info("  Interval:   %ds", INTERVAL_SEC)
+    log.info("=" * 50)
+
     prices: list[Decimal] = []
     position_qty = Decimal("0")
-    position_entry = Decimal("0")
-    tick = 0
-
-    log.info("=== Toolkit Trading Bot ===")
-    log.info("Symbol: %s | Qty: %s | Dry-pun: %s | Interval: %ss", symbol, qty, DRY_RUN, INTERVAL_SEC)
-    log.info("Entry: %s bps | Stop: %s bps | TP: %s bps | FeeGate: %s bps",
-             ENTRY_MOMENTUM_BPS, STOP_LOSS_BPS, TAKE_PROFIT_BPS, MIN_PROFIT_BPS)
+    entry_price = Decimal("0")
+    cycle = 0
 
     while True:
-        tick += 1
+        cycle += 1
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
         try:
-            price = get_price(symbol)
-            prices.append(price)
-            if len(prices) > SLOW_WINDOW * 2:
-                prices.pop(0)
+            # Fetch data
+            klines = get_klines(symbol, limit=SLOW_WINDOW + 5)
+            close_prices = [k["close"] for k in klines]
+            current_price = close_prices[-1]
+            prices = close_prices
 
-            action = decide(symbol, prices, position_qty, position_entry)
-            mom = momentum_bps(prices)
+            # Update position info
+            try:
+                position_qty = get_position_qty(symbol.replace("USDT", ""))
+                if position_qty > 0 and entry_price == 0:
+                    # Estimate entry from current price if not set
+                    entry_price = current_price
+            except Exception:
+                pass  # account endpoint may fail on free-tier IP
 
-            if action == "BUY":
-                result = place_order(symbol, "BUY", qty)
-                position_qty = qty
-                position_entry = price
-                status = "TEST" if DRY_RUN else result.get("status", "?")
-                log.info("🔵 BUY %s %s @ %s | status=%s", qty, symbol, price, status)
-
-            elif action == "SELL":
-                result = place_order(symbol, "SELL", position_qty)
-                pnl_bps = ((price - position_entry) / position_entry) * Decimal("10000")
-                status = "TEST" if DRY_RUN else result.get("status", "?")
-                log.info("🔴 SELL %s %s @ %s | pnl=%.1f bps | status=%s",
-                         position_qty, symbol, price, pnl_bps, status)
+            # Check exit conditions
+            exit_signal = should_exit(symbol, entry_price, current_price,
+                                       position_qty)
+            if exit_signal and position_qty > 0:
+                log.info("🛑 %s triggered at %s (%s)", exit_signal,
+                         current_price, now_utc)
+                try:
+                    result = place_order(symbol, "SELL", position_qty)
+                    log.info("✅ SELL executed: %s", json.dumps(
+                        result if isinstance(result, dict) else {}, default=str))
+                except Exception as e:
+                    log.error("SELL failed: %s", e)
                 position_qty = Decimal("0")
-                position_entry = Decimal("0")
+                entry_price = Decimal("0")
+                continue
 
+            # Get trading signal
+            sig = compute_signal(prices)
+            action = sig["action"]
+
+            # Act on signal
+            if action in ("BUY", "SELL") and position_qty == 0:
+                log.info("📡 Signal: %s (%s) — %s", action,
+                         sig["reason"], now_utc)
+                try:
+                    result = place_order(symbol, action, qty)
+                    log.info("✅ %s order placed: %s", action,
+                             json.dumps(
+                                 result if isinstance(result, dict) else {},
+                                 default=str))
+                    entry_price = current_price
+                except Exception as e:
+                    log.error("%s order failed: %s", action, e)
+            elif action in ("BUY", "SELL") and position_qty > 0 and action == "SELL":
+                log.info("📡 SELL signal while in position — %s", now_utc)
+                try:
+                    result = place_order(symbol, "SELL", position_qty)
+                    log.info("✅ SELL executed: %s", json.dumps(
+                        result if isinstance(result, dict) else {}, default=str))
+                except Exception as e:
+                    log.error("SELL failed: %s", e)
+                position_qty = Decimal("0")
+                entry_price = Decimal("0")
             else:
-                if tick % 10 == 0:
-                    log.debug("HOLD mom=%.1f bps prices=%d", mom or 0, len(prices))
+                log.info("⏸️  HOLD [%s] (%s)", sig["reason"], now_utc)
 
-        except requests.RequestException as e:
-            log.error("API error: %s", e)
         except Exception as e:
-            log.exception("Unexpected error: %s", e)
+            log.error("Cycle %d error: %s", cycle, e)
 
         time.sleep(INTERVAL_SEC)
 
 
-# ── Entry Point ──────────────────────────────────────────
 if __name__ == "__main__":
-    import sys
-
-    symbol = sys.argv[1] if len(sys.argv) > 1 else "BTCUSDT"
-    qty = Decimal(sys.argv[2]) if len(sys.argv) > 2 else Decimal("0.001")
-
-    print(f"\n{'⚠️  DRY RUN MODE — no real orders' if DRY_RUN else '🚀 LIVE MODE — real orders enabled'}")
-    print(f"Symbol: {symbol} | Qty: {qty}\n")
-
-    run(symbol, qty)
+    main()

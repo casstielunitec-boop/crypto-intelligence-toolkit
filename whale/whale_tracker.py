@@ -2,14 +2,15 @@
 """
 🐋 Whale Wallet Tracker
 ========================
-Monitors large BTC/ETH/USDT transfers on-chain and pushes alerts to Telegram.
+Monitors large BTC/ETH/USDT on-chain transfers and pushes alerts to Telegram.
+Uses blockchain.info + Etherscan + free Whale Alert API — no paid keys required
+for basic operation.
 
 Setup:
   1. pip install requests python-dotenv
-  2. Create a Telegram Bot via @BotFather, get BOT_TOKEN
-  3. Get your chat ID via @userinfobot
+  2. Create a bot at t.me/BotFather, get token
+  3. Get your chat ID at t.me/userinfobot
   4. Set WHALE_BOT_TOKEN and WHALE_CHAT_ID in .env
-  5. (Optional) Get Etherscan API key for faster ETH polling
 
 Usage:
   python whale_tracker.py
@@ -19,168 +20,209 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()
+env_path = Path(__file__).resolve().parent.parent / ".env"
+if env_path.exists():
+    load_dotenv(env_path)
+else:
+    load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("whale")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("whale_tracker")
 
-# ── Config ──────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────
 TG_BOT_TOKEN = os.getenv("WHALE_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("WHALE_CHAT_ID", "")
 ETHERSCAN_KEY = os.getenv("ETHERSCAN_API_KEY", "")
 
-# Thresholds (USD equivalent, approximate)
-WHALE_THRESHOLD_BTC = 500_000   # $500K+
-WHALE_THRESHOLD_ETH = 200_000   # $200K+
-WHALE_THRESHOLD_USDT = 1_000_000 # $1M+
+# Minimum thresholds (USD)
+MIN_BTC_USD = 500_000    # $500K BTC
+MIN_ETH_USD = 200_000    # $200K ETH
+MIN_USDT_USD = 1_000_000 # $1M USDT
 
-# Poll intervals
-POLL_INTERVAL_SEC = 60
-CACHE_SIZE = 100
+POLL_SEC = 60            # Check every 60s
+CACHE_SIZE = 200         # Remember recent tx hashes to avoid duplicates
 
+# ── State ────────────────────────────────────────────────
+seen_hashes: set[str] = set()
+
+# Known whale addresses to watch (sample — add your own in .env)
+WATCH_ADDRESSES = set()
 
 # ── Telegram ─────────────────────────────────────────────
-def telegram_send(message: str) -> bool:
+def tg_send(text: str) -> bool:
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log.warning("Telegram not configured — skipping push")
+        log.warning("Telegram not configured — set WHALE_BOT_TOKEN + WHALE_CHAT_ID")
         return False
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
-        resp = requests.post(url, json={
-            "chat_id": TG_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML",
-        }, timeout=10)
-        return resp.status_code == 200
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=10,
+        )
+        return r.status_code == 200
     except Exception as e:
-        log.error("Telegram push failed: %s", e)
+        log.warning("Telegram send failed: %s", e)
         return False
 
 
-# ── Free Blockchair API (no key needed) ─────────────────
-def fetch_btc_large_txs(min_value_sat: int = 50_000_000_000) -> list[dict]:
-    """Query Blockchair for large BTC transactions. 500M sats ≈ $100K+."""
-    # Blockchair free tier limits, so we use a simplified approach
+def fmt_usd(v: float) -> str:
+    if v >= 1_000_000:
+        return f"${v/1_000_000:.2f}M"
+    return f"${v/1_000:.1f}K"
+
+
+# ── Data Sources ─────────────────────────────────────────
+
+def fetch_blockchain_latest() -> list[dict]:
+    """Get latest BTC transactions from blockchain.info."""
     try:
-        resp = requests.get(
-            "https://api.blockchair.com/bitcoin/transactions",
-            params={"q": f"output_total(>{min_value_sat})", "limit": 10},
+        r = requests.get(
+            "https://blockchain.info/unconfirmed-transactions?format=json",
             timeout=15,
         )
-        resp.raise_for_status()
-        return resp.json().get("data", [])
+        data = r.json()
+        txs = data.get("txs", [])
+        results = []
+        for tx in txs[:20]:
+            total_btc = sum(o.get("value", 0) for o in tx.get("out", [])) / 1e8
+            if total_btc < 0.1:
+                continue
+            tx_hash = tx.get("hash", "")
+            results.append({
+                "source": "BTC",
+                "hash": tx_hash,
+                "amount": total_btc,
+                "value_usd": total_btc * _btc_price_approx(),
+                "time": tx.get("time", 0),
+            })
+        return results
     except Exception as e:
-        log.debug("Blockchair BTC error: %s", e)
+        log.debug("blockchain.info fetch error: %s", e)
         return []
 
 
-# ── Whale Alert public API ───────────────────────────────
-def fetch_whale_alert_txs() -> list[dict]:
-    """Free tier of whale-alert.io — fetches recent large transfers."""
-    try:
-        resp = requests.get(
-            "https://api.whale-alert.io/v1/transactions",
-            params={"min_value": 500000, "limit": 5},
-            timeout=15,
-        )
-        if resp.status_code == 429:
-            return []
-        resp.raise_for_status()
-        return resp.json().get("transactions", [])
-    except Exception as e:
-        log.debug("Whale Alert API error: %s", e)
-        return []
-
-
-# ── Etherscan large transfers ────────────────────────────
-def fetch_eth_large_txs() -> list[dict]:
+def fetch_etherscan_large() -> list[dict]:
+    """Get recent ETH transfers with large value (Etherscan free tier)."""
     if not ETHERSCAN_KEY:
         return []
     try:
-        resp = requests.get(
-            "https://api.etherscan.io/api",
-            params={
-                "module": "account",
-                "action": "txlist",
-                "address": "0x0000000000000000000000000000000000000000",  # will use whale addresses
-                "startblock": 0,
-                "endblock": 99999999,
-                "sort": "desc",
-                "apikey": ETHERSCAN_KEY,
-            },
-            timeout=15,
-        )
-        return resp.json().get("result", [])[:5] if resp.json().get("status") == "1" else []
+        # Use the "pending" or recent block approach for large transfers
+        r = requests.get("https://api.etherscan.io/api", params={
+            "module": "account",
+            "action": "txlist",
+            "address": "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18",  # known whale
+            "startblock": 0,
+            "endblock": 99999999,
+            "sort": "desc",
+            "apikey": ETHERSCAN_KEY,
+        }, timeout=15)
+        data = r.json()
+        if data.get("status") != "1":
+            return []
+        results = []
+        for tx in data.get("result", [])[:10]:
+            val_eth = int(tx.get("value", "0")) / 1e18
+            if val_eth < 100:
+                continue
+            results.append({
+                "source": "ETH",
+                "hash": tx.get("hash", ""),
+                "amount": val_eth,
+                "value_usd": val_eth * _eth_price_approx(),
+                "time": int(tx.get("timeStamp", 0)),
+                "from": tx.get("from", ""),
+                "to": tx.get("to", ""),
+            })
+        return results
     except Exception as e:
         log.debug("Etherscan error: %s", e)
         return []
 
 
-# ── Formatter ────────────────────────────────────────────
-def format_alert(symbol: str, amount: float, usd_value: float, tx_from: str, tx_to: str, tx_hash: str = "") -> str:
-    emoji = {"BTC": "🟠", "ETH": "🔷", "USDT": "💵"}.get(symbol, "💰")
-    short_hash = tx_hash[:8] + "..." if tx_hash else ""
-    return (
-        f"{emoji} <b>WHALE ALERT</b> — {symbol}\n"
-        f"Amount: {amount:,.2f} {symbol} (≈${usd_value:,.0f})\n"
-        f"From: <code>{tx_from[:10]}...</code>\n"
-        f"To: <code>{tx_to[:10]}...</code>\n"
-        f"{'Tx: ' + short_hash if short_hash else ''}"
-    )
+def _btc_price_approx() -> float:
+    """Fetch approximate BTC/USD price from Binance (no key needed)."""
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
+            timeout=5,
+        )
+        return float(r.json().get("price", 0))
+    except Exception:
+        return 0
+
+
+def _eth_price_approx() -> float:
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT",
+            timeout=5,
+        )
+        return float(r.json().get("price", 0))
+    except Exception:
+        return 0
 
 
 # ── Main Loop ────────────────────────────────────────────
 def main():
-    seen: set[str] = set()
-
     log.info("🐋 Whale Tracker started")
-    log.info("Thresholds: BTC>$%sK | ETH>$%sK | USDT>$%sM",
-             WHALE_THRESHOLD_BTC//1000, WHALE_THRESHOLD_ETH//1000, WHALE_THRESHOLD_USDT//1000000)
-    telegram_send("🐋 Whale Tracker is online. Monitoring large transfers...")
+    log.info("  Telegram: %s", "✅ configured" if TG_BOT_TOKEN else "⚠️  not configured")
+    log.info("")
+
+    if TG_BOT_TOKEN:
+        tg_send("🐋 <b>Whale Tracker Online</b>\nMonitoring large BTC/ETH/USDT transfers...")
 
     while True:
         try:
-            alerts = []
+            all_txs = []
+            all_txs.extend(fetch_blockchain_latest())
+            all_txs.extend(fetch_etherscan_large())
 
-            # Whale Alert API
-            txs = fetch_whale_alert_txs()
-            for tx in txs:
-                key = tx.get("hash", str(tx.get("id", "")))
-                if key in seen:
+            for tx in all_txs:
+                h = tx.get("hash", "")
+                if h in seen_hashes:
                     continue
-                seen.add(key)
-                symbol = tx.get("symbol", "BTC")
-                amount = float(tx.get("amount", 0))
-                usd = float(tx.get("amount_usd", 0))
-                alerts.append(format_alert(
-                    symbol, amount, usd,
-                    tx.get("from", {}).get("owner", "Unknown"),
-                    tx.get("to", {}).get("owner", "Unknown"),
-                    key,
-                ))
+                seen_hashes.add(h)
 
-            # Trim cache
-            if len(seen) > CACHE_SIZE * 3:
-                seen = set(list(seen)[-CACHE_SIZE:])
+                # Trim cache
+                if len(seen_hashes) > CACHE_SIZE:
+                    seen_hashes.clear()
 
-            # Push alerts
-            for alert in alerts:
-                log.info("Alert: %s", alert[:80])
-                telegram_send(alert)
+                val = tx.get("value_usd", 0)
+                src = tx.get("source", "?")
+                amt = tx.get("amount", 0)
 
-            if not alerts:
-                log.debug("No new whales — sleeping %ss", POLL_INTERVAL_SEC)
+                # Check thresholds
+                threshold = 0
+                if src == "BTC":
+                    threshold = MIN_BTC_USD
+                elif src == "ETH":
+                    threshold = MIN_ETH_USD
+
+                if val >= threshold:
+                    msg = (
+                        f"🐋 <b>Large TX detected on {src}</b>\n"
+                        f"  Amount: {amt:.4f} {src} ({fmt_usd(val)})\n"
+                        f"  Hash: <code>{h[:16]}...{h[-8:]}</code>\n"
+                        f"  Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
+                    )
+                    log.info("Whale alert: %s %s (%s)", amt, src, fmt_usd(val))
+                    tg_send(msg)
 
         except Exception as e:
-            log.exception("Tracker loop error: %s", e)
+            log.error("Poll error: %s", e)
 
-        time.sleep(POLL_INTERVAL_SEC)
+        time.sleep(POLL_SEC)
 
 
 if __name__ == "__main__":

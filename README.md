@@ -56,15 +56,18 @@ This toolkit has already saved its owners thousands:
 
 ## Get It Now
 
-**$39 — one time payment. Pay with crypto:**
+**$39 — one time payment. Two ways to pay:**
 
+### 💳 Credit Card
+→ **[Buy on Gumroad](https://gumroad.com/l/crypto-trading-toolkit)**
+
+Instant download after payment. Secure checkout.
+
+### ₿ Crypto (USDT)
 ```
 USDT (BASE network): 0x55048FA1c45E7E45ae6c6f8e02Cb2565F6C04d14
 ```
-
-Send $39 USDT on BASE network. I'll email you the download link within 24 hours.
-
-Credit card payments coming soon via Gumroad.
+Send $39 USDT on BASE network. Download link sent within 24h.
 
 ## Who Built This
 
